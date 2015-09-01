@@ -42,14 +42,9 @@ public final class JVMUtils {
     Objects.requireNonNull(closeable);
     synchronized (closeAtShutdown) {
       if (closeAtShutdown.isEmpty()) {
-        Runtime.getRuntime().addShutdownHook(new Thread(new Runnable() {
-          @Override
-          public void run() {
-            synchronized (closeAtShutdown) {
-              for (Closeable c : closeAtShutdown) {
-                IOUtils.closeQuietly(c);
-              }
-            }
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+          synchronized (closeAtShutdown) {
+            closeAtShutdown.forEach(IOUtils::closeQuietly);
           }
         }, "OryxShutdownHookThread"));
       }
