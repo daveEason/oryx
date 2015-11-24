@@ -34,7 +34,7 @@ function usageAndExit {
   echo "    --conf       Oryx configuration file, like oryx.conf. Defaults to 'oryx.conf'"
   echo "    --app-jar    User app JAR file"
   echo "    --jvm-args   Extra args to Oryx JVM processes (including drivers and executors)"
-  echo "    --deployment Only for Serving Layer now; can be 'yarn' or 'local', Default: local."
+  echo "    --deployment Valid values include 'yarn' or 'local', Default: local."
   echo "    --input-file Only for kafka-input. Input file to send"
   echo "    --help       Display this message"
   exit 1
@@ -114,40 +114,43 @@ batch|speed|serving)
     APP_JAR_NAME=`basename ${APP_JAR}`
   fi
 
+# TODO: Remove dependence on local compute-classpath.sh, only required for local deployment mode
   COMPUTE_CLASSPATH="compute-classpath.sh"
   if [ ! -x "$COMPUTE_CLASSPATH" ]; then
     usageAndExit "$COMPUTE_CLASSPATH script does not exist or isn't executable"
   fi
   BASE_CLASSPATH=`bash ${COMPUTE_CLASSPATH} | paste -s -d: -`
-  # Need to ship examples JAR with app as it conveniently contains right Kafka, in Spark
-  SPARK_EXAMPLES_JAR=`bash ${COMPUTE_CLASSPATH} | grep spark-examples`
 
-  SPARK_STREAMING_JARS="${LAYER_JAR},${SPARK_EXAMPLES_JAR}"
   if [ "${APP_JAR}" != "" ]; then
-    SPARK_STREAMING_JARS="${APP_JAR},${SPARK_STREAMING_JARS}"
+    SPARK_STREAMING_JARS="${APP_JAR}"
   fi
-  SPARK_EXECUTOR_JAVA_OPTS="-Dconfig.file=${CONFIG_FILE_NAME} -Dsun.io.serialization.extendeddebuginfo=true"
+
+  SPARK_EXECUTOR_JAVA_OPTS="-Dconfig.file=${CONFIG_FILE_NAME}"
   if [ -n "${JVM_ARGS}" ]; then
     SPARK_EXECUTOR_JAVA_OPTS="${JVM_ARGS} ${SPARK_EXECUTOR_JAVA_OPTS}"
   fi
   SPARK_STREAMING_PROPS="-Dspark.yarn.dist.files=${CONFIG_FILE} \
-   -Dspark.jars=${SPARK_STREAMING_JARS} \
    -Dsun.io.serialization.extendeddebuginfo=true \
    -Dspark.executor.extraJavaOptions=\"${SPARK_EXECUTOR_JAVA_OPTS}\""
 
   MAIN_CLASS="com.cloudera.oryx.${COMMAND}.Main"
+  APP_ID=`echo "${CONFIG_PROPS}" | grep -E "^oryx\.id=.+$" | grep -oE "[^=]+$"`
   case "${COMMAND}" in
     batch)
+      # Batch Layer configuration
       JVM_HEAP_MB=`echo "${CONFIG_PROPS}" | grep -E "^oryx\.batch\.streaming\.driver-memory=.+$" | grep -oE "[^=]+$"`
       EXTRA_PROPS="-Xmx${JVM_HEAP_MB} ${SPARK_STREAMING_PROPS}"
+      YARN_APP_NAME="OryxBatchLayer-${APP_ID}"
       ;;
     speed)
+      # Speed Layer configuration
       JVM_HEAP_MB=`echo "${CONFIG_PROPS}" | grep -E "^oryx\.speed\.streaming\.driver-memory=.+$" | grep -oE "[^=]+$"`
       EXTRA_PROPS="-Xmx${JVM_HEAP_MB} ${SPARK_STREAMING_PROPS}"
+      YARN_APP_NAME="OryxSpeedLayer-${APP_ID}"
       ;;
     serving)
+      # Serving Layer configuration
       MEMORY_MB=`echo "${CONFIG_PROPS}" | grep -E "^oryx\.serving\.memory=.+$" | grep -oE "[^=]+$" | grep -oE "[0-9]+"`
-      # Only for Serving Layer now
       if [ "${DEPLOYMENT}" == "yarn" ]; then
         YARN_CORES=`echo "${CONFIG_PROPS}" | grep -E "^oryx\.serving\.yarn\.cores=.+$" | grep -oE "[^=]+$"`
         YARN_INSTANCES=`echo "${CONFIG_PROPS}" | grep -E "^oryx\.serving\.yarn\.instances=.+$" | grep -oE "[^=]+$"`
@@ -161,82 +164,131 @@ batch|speed|serving)
       ;;
   esac
 
-  if [ -n "${YARN_APP_NAME}" ]; then
+  if [ "${DEPLOYMENT}" == "yarn" ]; then
     # Launch layer in YARN
-
     LAYER_JAR_NAME=`basename ${LAYER_JAR}`
-    FINAL_CLASSPATH="${LAYER_JAR_NAME}:${BASE_CLASSPATH}"
-    if [ -n "${APP_JAR_NAME}" ]; then
-      FINAL_CLASSPATH="${APP_JAR_NAME}:${FINAL_CLASSPATH}"
-    fi
 
-    LOCAL_SCRIPT_DIR="/tmp/${YARN_APP_NAME}"
-    LOCAL_SCRIPT="${LOCAL_SCRIPT_DIR}/run-yarn.sh"
-    YARN_LOG4J="${LOCAL_SCRIPT_DIR}/log4j.properties"
-    # YARN_APP_NAME will match the base of what distributedshell uses, in the home dir
-    HDFS_APP_DIR="${YARN_APP_NAME}"
+    # TODO: There are additional spark-submit options not reqpresented here (i.e. driver-cores for yarn-cluster mode), would required updates to reference.conf file to include configuration options (and defaults)
+    case "${COMMAND}" in
+      batch|speed)
 
-    # Only one copy of the app can be running anyway, so fail if it already seems
-    # to be running due to presence of directories
-    if [ -d ${LOCAL_SCRIPT_DIR} ]; then
-      usageAndExit "${LOCAL_SCRIPT_DIR} already exists; is ${YARN_APP_NAME} running?"
-    fi
-    if hdfs dfs -test -d ${HDFS_APP_DIR}; then
-      usageAndExit "${HDFS_APP_DIR} already exists; is ${YARN_APP_NAME} running?"
-    fi
+        LOCAL_LOG_DIR="/tmp/${YARN_APP_NAME}"
+        LOCAL_LOG_FILE="${LOCAL_LOG_DIR}/spark-submit-stdout-stderr-output.log"
 
-    # Make temp directories to stage resources, locally and in HDFS
-    mkdir -p ${LOCAL_SCRIPT_DIR}
-    hdfs dfs -mkdir -p ${HDFS_APP_DIR}
-    hdfs dfs -put ${LAYER_JAR} ${CONFIG_FILE} ${HDFS_APP_DIR}/
-    if [ -n "${APP_JAR}" ]; then
-      hdfs dfs -put ${APP_JAR} ${HDFS_APP_DIR}/
-    fi
+         # Only one copy of the app can be running anyway, so fail if it already seems
+        # to be running due to presence of directories
+        if [ -d ${LOCAL_LOG_DIR} ]; then
+          usageAndExit "${LOCAL_LOG_DIR} already exists; is ${YARN_APP_NAME} already running?"
+        fi
 
-    echo "log4j.logger.org.apache.hadoop.yarn.applications.distributedshell=WARN" >> ${YARN_LOG4J}
+        # Make temp directories to stage resources, locally and in HDFS
+        mkdir -p ${LOCAL_LOG_DIR}
 
-    # Need absolute path
-    OWNER=`hdfs dfs -stat '%u' ${HDFS_APP_DIR}`
-    echo "hdfs dfs -get /user/${OWNER}/${HDFS_APP_DIR}/* ." >> ${LOCAL_SCRIPT}
-    echo "java ${JVM_ARGS} ${EXTRA_PROPS} -Dconfig.file=${CONFIG_FILE_NAME} -cp ${FINAL_CLASSPATH} ${MAIN_CLASS}" >> ${LOCAL_SCRIPT}
+        echo "nohup spark-submit --class ${MAIN_CLASS}"
+        echo "--name ${YARN_APP_NAME}"
+        echo "--master yarn"
+        echo "--deploy-mode client "
+        echo "--driver-java-options ${SPARK_EXECUTOR_JAVA_OPTS} "
+        echo "--files ${CONFIG_FILE_NAME} "
+        echo "--conf spark.executor.extraJavaOptions=\"${SPARK_EXECUTOR_JAVA_OPTS}\" "
+        echo "--conf spark.executor.extraClassPath=./ "
+        echo "--verbose "
+        echo "${LAYER_JAR_NAME} > ${LOCAL_LOG_FILE} 2>&1 &"
+        echo
+        echo "To list the currently running YARN Application Masters in use 'yarn application -list'"
+        echo "which will return the application ID, to kill the application use 'yarn application -kill [app ID]"
+        echo "Local logs can be found in ${LOCAL_LOG_FILE}"
+        echo
 
-    YARN_DIST_SHELL_JAR=`bash ${COMPUTE_CLASSPATH} | grep distributedshell`
+        nohup spark-submit --class ${MAIN_CLASS} \
+              --name "${YARN_APP_NAME}" \
+              --master yarn \
+              --deploy-mode client \
+              --driver-java-options ${SPARK_EXECUTOR_JAVA_OPTS} \
+              --files ${CONFIG_FILE_NAME} \
+              --conf spark.executor.extraJavaOptions=\"${SPARK_EXECUTOR_JAVA_OPTS}\" \
+              --conf spark.executor.extraClassPath=./ \
+              --verbose \
+              ${LAYER_JAR_NAME} > ${LOCAL_LOG_FILE} 2>&1 &
 
-    echo "Running ${YARN_INSTANCES} ${YARN_APP_NAME} (${YARN_CORES} cores / ${MEMORY_MB}MB)"
-    echo "Note that you will need to find the Application Master in YARN to find the Serving Layer"
-    echo "instances, and kill the application with 'yarn application -kill [app ID]'"
-    echo
 
-    yarn jar ${YARN_DIST_SHELL_JAR} \
-      -jar ${YARN_DIST_SHELL_JAR} \
-      org.apache.hadoop.yarn.applications.distributedshell.Client \
-      -appname ${YARN_APP_NAME} \
-      -container_memory ${MEMORY_MB} \
-      -container_vcores ${YARN_CORES} \
-      -master_memory 256 \
-      -master_vcores 1 \
-      -num_containers ${YARN_INSTANCES} \
-      -log_properties ${YARN_LOG4J} \
-      -timeout 2147483647 \
-      -shell_script ${LOCAL_SCRIPT}
+        #TODO: This is currently failing when no 'jars' specified.  Need to build spark-submit as a string, add in components based upon conditionals
+        #TODO: deploy-mode cluster is not working, seems to be having an issue finding relevant configs, does work in client mode though, investigate further.
+      ;;
+      serving)
+      ## serving layer - yarn deployment
+        FINAL_CLASSPATH="${LAYER_JAR_NAME}:${BASE_CLASSPATH}"
+        if [ -n "${APP_JAR_NAME}" ]; then
+          FINAL_CLASSPATH="${APP_JAR_NAME}:${FINAL_CLASSPATH}"
+        fi
 
-    # TODO timeout above is the max, is 24 days, and can't be disabled
+        LOCAL_SCRIPT_DIR="/tmp/${YARN_APP_NAME}"
+        LOCAL_SCRIPT="${LOCAL_SCRIPT_DIR}/run-yarn.sh"
+        YARN_LOG4J="${LOCAL_SCRIPT_DIR}/log4j.properties"
+        # YARN_APP_NAME will match the base of what distributedshell uses, in the home dir
+        HDFS_APP_DIR="${YARN_APP_NAME}"
 
-    # Clean up temp dirs; they are only used by this application anyway
-    hdfs dfs -rm -r -skipTrash "${HDFS_APP_DIR}"
-    rm -r "${LOCAL_SCRIPT_DIR}"
+        # Only one copy of the app can be running anyway, so fail if it already seems
+        # to be running due to presence of directories
+        if [ -d ${LOCAL_SCRIPT_DIR} ]; then
+          usageAndExit "${LOCAL_SCRIPT_DIR} already exists; is ${YARN_APP_NAME} running?"
+        fi
+        if hdfs dfs -test -d ${HDFS_APP_DIR}; then
+          usageAndExit "${HDFS_APP_DIR} already exists; is ${YARN_APP_NAME} running?"
+        fi
 
+        # Make temp directories to stage resources, locally and in HDFS
+        mkdir -p ${LOCAL_SCRIPT_DIR}
+        hdfs dfs -mkdir -p ${HDFS_APP_DIR}
+        hdfs dfs -put ${LAYER_JAR} ${CONFIG_FILE} ${HDFS_APP_DIR}/
+        if [ -n "${APP_JAR}" ]; then
+          hdfs dfs -put ${APP_JAR} ${HDFS_APP_DIR}/
+        fi
+
+        echo "log4j.logger.org.apache.hadoop.yarn.applications.distributedshell=WARN" >> ${YARN_LOG4J}
+
+        # Need absolute path
+        OWNER=`hdfs dfs -stat '%u' ${HDFS_APP_DIR}`
+        echo "hdfs dfs -get /user/${OWNER}/${HDFS_APP_DIR}/* ." >> ${LOCAL_SCRIPT}
+        echo "java ${JVM_ARGS} ${EXTRA_PROPS} -Dconfig.file=${CONFIG_FILE_NAME} -cp ${FINAL_CLASSPATH} ${MAIN_CLASS}" >> ${LOCAL_SCRIPT}
+
+        YARN_DIST_SHELL_JAR=`bash ${COMPUTE_CLASSPATH} | grep distributedshell`
+
+        echo "Running ${YARN_INSTANCES} ${YARN_APP_NAME} (${YARN_CORES} cores / ${MEMORY_MB}MB)"
+        echo "Note that you will need to find the Application Master in YARN to find the Serving Layer"
+        echo "instances, and kill the application with 'yarn application -kill [app ID]'"
+        echo
+
+        yarn jar ${YARN_DIST_SHELL_JAR} \
+          -jar ${YARN_DIST_SHELL_JAR} \
+          org.apache.hadoop.yarn.applications.distributedshell.Client \
+          -appname ${YARN_APP_NAME} \
+          -container_memory ${MEMORY_MB} \
+          -container_vcores ${YARN_CORES} \
+          -master_memory 256 \
+          -master_vcores 1 \
+          -num_containers ${YARN_INSTANCES} \
+          -log_properties ${YARN_LOG4J} \
+          -timeout 2147483647 \
+          -shell_script ${LOCAL_SCRIPT}
+
+        # TODO timeout above is the max, is 24 days, and can't be disabled
+
+        # Clean up temp dirs; they are only used by this application anyway
+        hdfs dfs -rm -r -skipTrash "${HDFS_APP_DIR}"
+        rm -r "${LOCAL_SCRIPT_DIR}"
+      ;;
+    esac
   else
-    # Launch Layer as local process
 
+    # Launch Layer as local process
     FINAL_CLASSPATH="${LAYER_JAR}:${BASE_CLASSPATH}"
     if [ -n "${APP_JAR}" ]; then
       FINAL_CLASSPATH="${APP_JAR}:${FINAL_CLASSPATH}"
     fi
     java ${JVM_ARGS} ${EXTRA_PROPS} -Dconfig.file=${CONFIG_FILE} -cp ${FINAL_CLASSPATH} ${MAIN_CLASS}
-
   fi
-  ;;
+;;
 
 kafka-setup|kafka-tail|kafka-input)
 
